@@ -1,11 +1,10 @@
 # scaling_jae
 
-HPC GPU scaling benchmarks, organized by GPU. The main study is on the **NVIDIA Blackwell B200**, with two independent tracks under `b200/`:
+HPC GPU scaling benchmarks, organized by GPU. The first study is on the **NVIDIA Blackwell B200**, under `b200/`:
 
 - **`b200/alignn_ff/`** — ALIGNN-FF (graph neural network force field) inference scaling on Cu FCC supercells, via PyTorch + DGL + matscipy on a single B200. System sizes from N = 4 to ~780k atoms.
-- **`b200/vasp_dft/`** — VASP plane-wave DFT single-point SCF scaling on Si diamond supercells (2·n³ atoms), across 1/2/4/8 B200 GPUs.
 
-Each track has its own regenerable analysis under `analysis/` with an analyze script, a metrics JSON, plots, and a summary (`v*_`-prefixed under `b200/alignn_ff/analysis/v*/`). For detailed findings, read the summary files — this README is a map.
+It has its own regenerable analysis under `analysis/` with an analyze script, a metrics JSON, plots, and a summary (`v*_`-prefixed under `b200/alignn_ff/analysis/v*/`). For detailed findings, read the summary files — this README is a map.
 
 ALIGNN-FF was also run on an **NVIDIA GB10** (Grace-Blackwell, 121.7 GiB unified memory; `gb10/`) and an **NVIDIA H200 NVL** (139.8 GiB; `h200/`), and the top-level `analysis/` compares all GPUs in one plot and report.
 
@@ -16,13 +15,6 @@ ALIGNN-FF was also run on an **NVIDIA GB10** (Grace-Blackwell, 121.7 GiB unified
 - Iterated from a quadratic DGL `line_graph` bottleneck (v4) to a sparse hand-rolled construction (v5) that reduced per-iter cost by orders of magnitude and made N ~ 10⁵–10⁶ atom inference tractable on one B200.
 - Discovered a **float32 energy-drift cliff at N ≈ 470k atoms** — the same pristine Cu FCC crystal returns an energy that grows by up to +40% past the threshold, while float64 stays at 0.604 eV at all four sizes it could reach (up to 364,500 atoms). Diagnosed as a precision issue upstream of the graph-level readout (the `_Float64Pool` wrapper in v6 fixes a smaller pre-cliff drift but does not close the cliff; instrumentation in `probe_pool.py` shows the pool input is already corrupted).
 - **Validity window in f32: N ≤ 442,368 atoms.** See `b200/alignn_ff/analysis/v6/v6_summary.md`. On a GB10, chunked evaluation gives 0.604014 eV/atom up to 780,448 atoms (job 20862), so the error is in evaluating single graphs, not in the model; the operation responsible was not found.
-
-### VASP DFT (Si diamond)
-
-- Strong scaling of SCF runs across 3³–6³ supercells × 1/2/4/8 GPUs, plus single-shot timing at 10³–16³.
-- Best strong-scaling result in elapsed time: **1.27× on 4 GPUs at 6³ (432 atoms)**, 32% parallel efficiency. In elapsed time 8 GPUs is slower than 4 for every size tested, but that is setup and a first SCF cycle that grows with GPU count: the steady-state SCF cycle is fastest on 8 GPUs at the Γ-only sizes (2.63× faster than 1 GPU at 6³), so longer runs would favor more GPUs.
-- Size scaling on the 12³→14³ pair (3456 → 5488 atoms, 8 GPU, ALGO=Fast): elapsed time per SCF goes as **N^1.80**, but 86-87% of it is outside the SCF cycles; the second SCF cycle alone goes as **N^2.42**.
-- Two largest runs (15³ = 6750 atoms, 16³ = 8192 atoms) crashed before any SCF step completed with a segfault in MPI all-to-all communication on 8 GPUs, not an out-of-memory error. See `b200/vasp_dft/analysis/summary.md`.
 
 ### Cross-GPU comparison (GB10, H200 vs B200)
 
@@ -96,31 +88,27 @@ Every maximum-atom run with data, largest first within each group.
 
 § From the ALIGNN 2.0 paper's scaling table (energy + force).
 
-Forces include stress, except in chunked runs, which use layer checkpointing and rattled Si. Chunked `alignn_ff_*` models use a 20 Å halo, which changes forces by at most 2e-8 eV/Å on Si and 1.3e-7 eV/Å on SiGe in double precision. In single precision, roundoff alone makes chunked and full-cell forces differ by up to 1e-3 eV/Å (`gb10/alignn_ff_max_atoms/`). Differences among the `alignn_ff_*` models are where the host killed each run, as memory per atom is identical. 13,824 is the last size tried below the kill (17,576 was skipped). AFF-r2SCAN is the paper's force field (2+2 layers). The `alignn_ff_*` models have 4+4 layers. The untrained-architecture, UMA-S and paper-table rows come from the ALIGNN 2.0 project, and their raw data is not in this repo. VASP DFT, for reference: the largest converged run is 432 Si atoms, 5,488 on 8 B200s was a 2-step timing run, and 6,750 crashed.
+Forces include stress, except in chunked runs, which use layer checkpointing and rattled Si. Chunked `alignn_ff_*` models use a 20 Å halo, which changes forces by at most 2e-8 eV/Å on Si and 1.3e-7 eV/Å on SiGe in double precision. In single precision, roundoff alone makes chunked and full-cell forces differ by up to 1e-3 eV/Å (`gb10/alignn_ff_max_atoms/`). Differences among the `alignn_ff_*` models are where the host killed each run, as memory per atom is identical. 13,824 is the last size tried below the kill (17,576 was skipped). AFF-r2SCAN is the paper's force field (2+2 layers). The `alignn_ff_*` models have 4+4 layers. The untrained-architecture, UMA-S and paper-table rows come from the ALIGNN 2.0 project, and their raw data is not in this repo.
 
 ## Repo layout
 
 ```
 b200/
-├── alignn_ff/                ALIGNN-FF scaling on Cu FCC
-│   ├── scale5b_v{4,5,6}.py     versioned scaling scripts; v6 is the active one
-│   ├── diagnose_drift.py       f32 vs f64 + atom-permutation drift diagnosis
-│   ├── probe_pool.py           instrumented pool to isolate drift source
-│   ├── job*.sh                 SLURM wrappers (b200 partition)
-│   ├── scaling_alignn_v*.npz   per-size checkpoint data
-│   └── analysis/v{4,5,6}/      per-version study: v*_analyze.py + v*_summary.md + plots
-└── vasp_dft/                 VASP DFT SCF scaling on Si diamond supercells
-    ├── {3,4,5,6}x*/{1,2,4,8}/    strong-scaling sweep (all INCAR/OSZICAR/OUTCAR)
-    ├── {10,12,14,15,16}x*/{4,8}/ single-shot timing at larger sizes
-    └── analysis/                 analyze.py + summary.md + plots + metrics.json
+└── alignn_ff/                ALIGNN-FF scaling on Cu FCC
+    ├── scale5b_v{4,5,6}.py     versioned scaling scripts; v6 is the active one
+    ├── diagnose_drift.py       f32 vs f64 + atom-permutation drift diagnosis
+    ├── probe_pool.py           instrumented pool to isolate drift source
+    ├── job*.sh                 SLURM wrappers (b200 partition)
+    ├── scaling_alignn_v*.npz   per-size checkpoint data
+    └── analysis/v{4,5,6}/      per-version study: v*_analyze.py + v*_summary.md + plots
 gb10/, h200/                  ALIGNN-FF on one NVIDIA GB10 / H200 NVL
 ├── alignn_ff/                  energy+forces+stress sweep: bench_ff_scaling.py, job.sh, result JSON, README
 ├── alignn_ff_b200settings/     B200 settings on pure-PyTorch ALIGNN: scale_pure_b200settings.py, job.sh, result .npz
 └── alignn_ff_max_atoms/        GB10 only: four force fields, all evaluation paths, chunked to 2B atoms, polycrystal, gate stack and STMV virus, README
 analysis/                     cross-GPU comparison
-├── scaling_overview.py         -> scaling_overview.png (VASP + energy-only ALIGNN-FF on B200/GB10/H200)
+├── scaling_overview.py         -> scaling_overview.png (energy-only ALIGNN-FF on B200/GB10/H200)
 ├── scaling_forces.py           -> scaling_forces.png (energy+forces+stress ALIGNN-FF on GB10/H200)
-├── scaling_all.py              -> scaling_all.png (all seven runs on one plot)
+├── scaling_all.py              -> scaling_all.png (all five runs on one plot)
 ├── cross_gpu_figure.py         -> cross_gpu.png (two panels: energy-only B200/GB10/H200; with forces GB10/H200)
 ├── gb10_billion_figures.py     -> gb10_decomposition.png, gb10_scaling.png, gb10_halo.png (GB10 chunked runs)
 ├── gb10_energy_maps_figure.py  -> gb10_energy_maps.png (per-atom energy maps; needs the maps from energy_maps.py)
@@ -129,20 +117,17 @@ analysis/                     cross-GPU comparison
 
 ## Reproducing the analysis
 
-The raw data (`.npz` for ALIGNN-FF, `OUTCAR/OSZICAR` for VASP) is committed. Each `analyze.py` re-derives every plot and `metrics.json` from that data:
+The raw data (`.npz` and JSON for ALIGNN-FF) is committed. Each `analyze.py` re-derives every plot and `metrics.json` from that data:
 
 ```bash
 # ALIGNN-FF
 cd b200/alignn_ff/analysis/v6 && python v6_analyze.py
 
-# VASP DFT
-cd b200/vasp_dft/analysis && python analyze.py
-
 # cross-GPU plots and report (plots first)
 cd analysis && python scaling_overview.py && python scaling_forces.py && python scaling_all.py && python cross_gpu_figure.py && python results_report.py
 ```
 
-Requires `numpy` and `matplotlib` only. The actual ALIGNN-FF sweeps (scripts in `b200/alignn_ff/`) additionally need `torch`, `dgl`, `ase`, `matscipy`, `alignn`, and `jarvis-tools`, and were run on a Blackwell B200 via SLURM. The GB10 and H200 sweeps use the pure-PyTorch ALIGNN 2.0 (`torch`, `ase`, `matscipy`, `jarvis-tools`; no DGL) and were run via SLURM on atomgptlab (GB10) and Skipjack (H200). The VASP data was produced by the GPU build of VASP on the B200 partition; `INCAR` files are committed per run, but VASP binaries, `POSCAR`, and `POTCAR` are not.
+Requires `numpy` and `matplotlib` only. The actual ALIGNN-FF sweeps (scripts in `b200/alignn_ff/`) additionally need `torch`, `dgl`, `ase`, `matscipy`, `alignn`, and `jarvis-tools`, and were run on a Blackwell B200 via SLURM. The GB10 and H200 sweeps use the pure-PyTorch ALIGNN 2.0 (`torch`, `ase`, `matscipy`, `jarvis-tools`; no DGL) and were run via SLURM on atomgptlab (GB10) and Skipjack (H200).
 
 ## License
 

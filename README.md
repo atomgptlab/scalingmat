@@ -101,4 +101,4 @@ Each folder has its own README or summary. `analysis/results_report.py` collects
 
 ## License
 
-MIT, see `LICENSE`.
+Apache License 2.0, see `LICENSE`.

@@ -1,134 +1,104 @@
-# scaling_jae
+# scalingmat
 
-HPC GPU scaling benchmarks, organized by GPU. The first study is on the **NVIDIA Blackwell B200**, under `b200/`:
+Code, results and job logs for
 
-- **`b200/alignn_ff/`** — ALIGNN-FF (graph neural network force field) inference scaling on Cu FCC supercells, via PyTorch + DGL + matscipy on a single B200. System sizes from N = 4 to ~780k atoms.
+> J. Lee and K. Choudhary, *Scaling a Universal Graph Neural Network Force Field to Billions of Atoms on Desk-Side GPUs* (2026, submitted).
 
-It has its own regenerable analysis under `analysis/` with an analyze script, a metrics JSON, plots, and a summary (`v*_`-prefixed under `b200/alignn_ff/analysis/v*/`). For detailed findings, read the summary files — this README is a map.
+A universal graph neural network force field, ALIGNN-FF, evaluates the energies and forces of more than 10^9 atoms on NVIDIA GB10 desk-side computers (128 GB of CPU–GPU unified memory). The periodic cell is cut into cubes, and each cube is evaluated together with a halo of every atom within the model's 20 Å receptive field. Wherever the model's 52-neighbor cap does not bind, the result is exact: chunked and full-cell forces agree to about 1e-12 eV/Å in double precision. Because the GPU holds only one piece at a time, GPU memory no longer limits the size of the cell.
 
-ALIGNN-FF was also run on an **NVIDIA GB10** (Grace-Blackwell, 121.7 GiB unified memory; `gb10/`) and an **NVIDIA H200 NVL** (139.8 GiB; `h200/`), and the top-level `analysis/` compares all GPUs in one plot and report.
+All results use **AFF-r2SCAN-smooth**, ALIGNN-FF retrained on MatPES r2SCAN with smooth switches on its bond (4–5 Å) and angle (3.0–3.5 Å) messages. The published AFF-r2SCAN's forces jump at its 3.5 Å three-body cutoff. That jump stalls relaxations and breaks energy conservation in molecular dynamics.
 
-## Highlights
+- Weights of AFF-r2SCAN-smooth: [doi:10.6084/m9.figshare.35008936](https://doi.org/10.6084/m9.figshare.35008936)
+- Patch that adds the switches to ALIGNN: [`gb10/alignn_ff_max_atoms/smooth_messages.patch`](gb10/alignn_ff_max_atoms/smooth_messages.patch)
+- Detailed notes on every run, check and job: [`gb10/alignn_ff_max_atoms/README.md`](gb10/alignn_ff_max_atoms/README.md)
 
-### ALIGNN-FF (Cu FCC)
+## Main results (AFF-r2SCAN-smooth, single precision, GB10)
 
-- Iterated from a quadratic DGL `line_graph` bottleneck (v4) to a sparse hand-rolled construction (v5) that reduced per-iter cost by orders of magnitude and made N ~ 10⁵–10⁶ atom inference tractable on one B200.
-- Discovered a **float32 energy-drift cliff at N ≈ 470k atoms** — the same pristine Cu FCC crystal returns an energy that grows by up to +40% past the threshold, while float64 stays at 0.604 eV at all four sizes it could reach (up to 364,500 atoms). Diagnosed as a precision issue upstream of the graph-level readout (the `_Float64Pool` wrapper in v6 fixes a smaller pre-cliff drift but does not close the cliff; instrumentation in `probe_pool.py` shows the pool input is already corrupted).
-- **Validity window in f32: N ≤ 442,368 atoms.** See `b200/alignn_ff/analysis/v6/v6_summary.md`. On a GB10, chunked evaluation gives 0.604014 eV/atom up to 780,448 atoms (job 20862), so the error is in evaluating single graphs, not in the model; the operation responsible was not found.
+| System | Atoms | Forces | GB10s (tasks) | Largest piece | GPU (GB) | GB10-hours |
+|---|---:|:---:|---:|---:|---:|---:|
+| Si | 8,000,000 | yes | 1 (1) | 106,067 | 47.5 | 0.29 |
+| Si | 64,000,000 | yes | 6 (6) | 106,054 | 47.5 | 2.34 |
+| Si | 1,000,000,000 | no | 8 (10) | 261,222 | 49.3 | 9.29 |
+| Si | 1,000,000,000 | yes | 8 (12) | 71,578 | 31.9 | 43.2 |
+| Si | 2,000,376,000 | no | 9 (10) | 328,336 | 62.1 | 17.7 |
+| Si | 2,000,376,000 | yes | 9 (20) | 104,194 | 46.6 | 72.3 |
+| Si polycrystal, 4,800 grains | 1,021,299,267 | yes | 9 (10) | 69,056 | 30.8 | 45.1 |
+| Si/SiO2/Al gate stack | 102,361,540 | yes | 3 (6) | 39,059 | 52.8 | 10.7 |
+| STMV virus in water | 1,066,628 | yes | 1 (1) | 22,263 | 58.3 | 0.92 |
 
-### Cross-GPU comparison (GB10, H200 vs B200)
+GB10-hours are the summed wall time of all tasks, which is the time the run would take on one GB10. None of the runs reached a memory limit. As a single graph, one GB10 holds 216,000 Si atoms with forces (layer checkpointing, 118.8 GB) and 551,368 atoms for the energy alone. Si cells are rattled by 0.05 Å per component. Results with the original AFF-r2SCAN and three other ALIGNN-FF models are in the detailed notes.
 
-- **Same settings as the B200** (`*/alignn_ff_b200settings/`): Cu FCC, 5 Å cutoff, 12 neighbors, energy only, float32, checkpoint `v12.2.2024_dft_3d_307k`. DGL does not run on these machines, so the checkpoint is loaded into the pure-PyTorch ALIGNN model, which matches the B200 DGL energies within 1·10⁻⁵ eV/atom up to 500 atoms. Largest cell: **442,368 atoms** on the GB10 (112 GB; the next size is killed by the host) and **562,432 atoms** on the H200 (142.5 GB), against the B200's 780k. Model inference on the H200 is within 13% of the B200 (0.70 vs 0.62 s at 256k atoms) and ~8× faster than the GB10; graph construction is CPU-bound and depends on the host (1.1 s on the B200 and GB10 hosts, 1.5 s on the H200 host at 256k). Energies from these reruns show the pre-v6 float32 readout drift (0.604 → 0.600 eV/atom), and past ~470k atoms the H200 run reproduces the B200's float32 cliff (up to 0.658 eV/atom); timings are unaffected.
-- **Molecular-dynamics workload** (`*/alignn_ff/`): energy + forces + stress single points on Si diamond supercells with the 52-neighbor AFF-r2SCAN force field (figshare file 67360764, then the default `matpes_r2scan`). Largest cell: **54,872 atoms** on the GB10 (107 GB) and **74,088 atoms** on the H200 (145 GB). Memory is **1.95 MB/atom** on both through the ASE calculator, and the H200 is about **4× faster** than the GB10 from about 4,000 atoms up (2-5× below that). Through ASE, the same model uses 10× the memory per atom of energy only (0.195 MB/atom, `gb10/alignn_ff_max_atoms/`). Times through ASE are three model passes, because the calculator reruns the model for energy, forces and stress.
+## Running it
 
-- **Maximum atoms on the GB10** (`gb10/alignn_ff_max_atoms/`, added 2026-11-02, 1B atoms 2026-11-06): four force fields on Si, with and without forces. Largest single evaluation with AFF-r2SCAN: **551,368 atoms** energy only and **195,112 atoms** with forces and layer checkpointing (54,872 through ASE, reproduced). For the `alignn_ff_*` models: 238,328 (262,144 for `alignn_ff_matpes_r2scan`) and 97,336. Chunked with halos, forces reached **8M atoms on one GB10, 64M on five or six and 1B on four** without reaching a memory limit (slowest task 1,379 s for AFF-r2SCAN on five, 6,231 s for `alignn_ff_mptrj` on six, 14,522 s for AFF-r2SCAN at 1B). Without forces, 64M atoms on four took 351 s and 1,473 s per task, and 1B atoms on three took 3,235 s per task with AFF-r2SCAN. At 1B each task also held the whole cell, up to 73.9 GB of host memory in the GB10's shared CPU and GPU memory. Other structures (stage 6, 2026-11-07): per atom with forces, FCC Al and Cu cost 4 to 7 times as much as Si when chunked and water (where the 52-neighbor cap binds; a 20 A halo errs by 8e-8 eV/A) 17 times, so a billion atoms would take 35, 150, 229 and 577 GB10-hours for Si, Al, Cu and water. A Si polycrystal costs the same as single-crystal Si. Stages 7 to 10 (2026-11-08 to 09) added single points of 2,000,376,000 atoms of Si (17.0 GB10-hours without forces, 67.4 with), a 1,021,299,267-atom Si polycrystal (41.9) and a 102,361,540-atom Si/SiO2/Al gate stack (9.9), all with AFF-r2SCAN. Stage 11 (2026-11-09) evaluated the 1,066,628-atom NAMD STMV virus benchmark once on one GB10 (0.86 GB10-hours), a test of size and cost only, since the model's accuracy on biomolecules has not been tested. A 155,281-atom polycrystal relaxation stopped at a largest force of 0.5 eV/Å, because the model's forces jump at its 3.5 Å three-body cutoff.
-
-## Maximum atoms by GPU
-
-Every maximum-atom run with data, largest first within each group.
-
-| GPU | Forces | Max atoms | How | Model | Element |
-|---|---|---:|---|---|---|
-| **B200** | no | 780,448† | 1 GPU | `v12.2.2024_dft_3d_307k` | Cu |
-|  | yes | not run | | | |
-| **GB10** | no | 2,000,376,000‡ | 7 GPUs, chunked, lattice-generated | AFF-r2SCAN | Si |
-| | no | 1,000,000,000‡ | 3 GPUs, chunked | AFF-r2SCAN | Si |
-| | no | 64,000,000‡ | 4 GPUs, chunked | AFF-r2SCAN | Si |
-| | no | 64,000,000‡ | 4 GPUs, chunked | `alignn_ff_mptrj` | Si |
-| | no | 8,000,000‡ | 1 GPU, chunked | AFF-r2SCAN | Si |
-|  | no | 8,000,000‡ | 1 GPU, chunked | `alignn_ff_mptrj` | Si |
-|  | no | 8,000,000‡ | 1 GPU, chunked | `alignn_ff_matpes_pbe` | Si |
-|  | no | 8,000,000‡ | 1 GPU, chunked | `alignn_ff_matpes_r2scan` | Si |
-|  | no | 551,368 | 1 GPU | AFF-r2SCAN | Si |
-|  | no | 453,962 | 1 GPU | Untrained radius model | Si |
-|  | no | 442,368† | 1 GPU | `v12.2.2024_dft_3d_307k` | Cu |
-|  | no | 262,144 | 1 GPU | `alignn_ff_matpes_r2scan` | Si |
-|  | no | 238,328 | 1 GPU | `alignn_ff_mptrj` | Si |
-|  | no | 238,328 | 1 GPU | `alignn_ff_matpes_pbe` | Si |
-|  | no | 186,624 | 1 GPU | AFF-r2SCAN | Al |
-|  | no | 157,216 | 1 GPU | AFF-r2SCAN | Cu |
-|  | no | 101,306 | 1 GPU | Untrained kNN model | Si |
-|  | no | 98,304 | 1 GPU | AFF-r2SCAN | water |
-|  | yes | 2,000,376,000‡ | 9 GPUs, chunked, lattice-generated | AFF-r2SCAN | Si |
-|  | yes | 1,021,299,267‡ | 9 GPUs, chunked | AFF-r2SCAN | Si polycrystal |
-|  | yes | 1,000,000,000‡ | 4 GPUs, chunked | AFF-r2SCAN | Si |
-|  | yes | 102,361,540‡ | 6 GPUs, chunked | AFF-r2SCAN | Si/SiO2/Al stack |
-|  | yes | 64,000,000‡ | 6 GPUs, chunked | `alignn_ff_mptrj` | Si |
-|  | yes | 64,000,000‡ | 5 GPUs, chunked | AFF-r2SCAN | Si |
-|  | yes | 8,000,000‡ | 1 GPU, chunked | AFF-r2SCAN | Si |
-|  | yes | 8,000,000‡ | 1 GPU, chunked | `alignn_ff_mptrj` | Si |
-|  | yes | 8,000,000‡ | 1 GPU, chunked | `alignn_ff_matpes_pbe` | Si |
-|  | yes | 8,000,000‡ | 1 GPU, chunked | `alignn_ff_matpes_r2scan` | Si |
-|  | yes | 195,112 | 1 GPU, checkpointed | AFF-r2SCAN | Si |
-|  | yes | 140,608 | 1 GPU, `forward_tensors` | AFF-r2SCAN | Si |
-|  | yes | 97,336 | 1 GPU, checkpointed | `alignn_ff_mptrj` | Si |
-|  | yes | 97,336 | 1 GPU, checkpointed | `alignn_ff_matpes_pbe` | Si |
-|  | yes | 97,336 | 1 GPU, checkpointed | `alignn_ff_matpes_r2scan` | Si |
-|  | yes | 70,304 | 1 GPU, checkpointed | AFF-r2SCAN | Al |
-|  | yes | 70,304 | 1 GPU, checkpointed | AFF-r2SCAN | Cu |
-|  | yes | 54,872 | 1 GPU, ASE | AFF-r2SCAN | Si |
-|  | yes | 46,656 | 1 GPU, `forward_tensors` | `alignn_ff_matpes_r2scan` | Si |
-|  | yes | 41,472 | 1 GPU, checkpointed | AFF-r2SCAN | water |
-|  | yes | 39,304 | 1 GPU, `forward_tensors` | `alignn_ff_mptrj` | Si |
-|  | yes | 39,304 | 1 GPU, `forward_tensors` | `alignn_ff_matpes_pbe` | Si |
-|  | yes | 13,824 | 1 GPU, ASE | `alignn_ff_mptrj` | Si |
-|  | yes | 13,824 | 1 GPU, ASE | `alignn_ff_matpes_pbe` | Si |
-|  | yes | 13,824 | 1 GPU, ASE | `alignn_ff_matpes_r2scan` | Si |
-| **H200** | no | 562,432† | 1 GPU | `v12.2.2024_dft_3d_307k` | Cu |
-|  | yes | 74,088 | 1 GPU, ASE | AFF-r2SCAN | Si |
-| **GB10, other groups' models** | yes | 140,608§ | 1 GPU | UMA-S | Si |
-|  | yes | 128,000‡ | 1 GPU | UMA-S | Si |
-|  | yes | 32,768§ | 1 GPU | M3GNet-MatPES-PBE | Si |
-|  | yes | 21,952§ | 1 GPU | MACE-MP-0 | Si |
-|  | yes | 21,952§ | 1 GPU | CHGNet | Si |
-
-† Energies go wrong past 442,368 atoms on the B200 and H200. The GB10 and H200 runs also drift by up to 0.004 eV/atom below that.
-
-‡ Largest size tried, no memory limit reached.
-
-§ From the ALIGNN 2.0 paper's scaling table (energy + force).
-
-Forces include stress, except in chunked runs, which use layer checkpointing and rattled Si. Chunked `alignn_ff_*` models use a 20 Å halo, which changes forces by at most 2e-8 eV/Å on Si and 1.3e-7 eV/Å on SiGe in double precision. In single precision, roundoff alone makes chunked and full-cell forces differ by up to 1e-3 eV/Å (`gb10/alignn_ff_max_atoms/`). Differences among the `alignn_ff_*` models are where the host killed each run, as memory per atom is identical. 13,824 is the last size tried below the kill (17,576 was skipped). AFF-r2SCAN is the paper's force field (2+2 layers). The `alignn_ff_*` models have 4+4 layers. The untrained-architecture, UMA-S and paper-table rows come from the ALIGNN 2.0 project, and their raw data is not in this repo.
-
-## Repo layout
-
-```
-b200/
-└── alignn_ff/                ALIGNN-FF scaling on Cu FCC
-    ├── scale5b_v{4,5,6}.py     versioned scaling scripts; v6 is the active one
-    ├── diagnose_drift.py       f32 vs f64 + atom-permutation drift diagnosis
-    ├── probe_pool.py           instrumented pool to isolate drift source
-    ├── job*.sh                 SLURM wrappers (b200 partition)
-    ├── scaling_alignn_v*.npz   per-size checkpoint data
-    └── analysis/v{4,5,6}/      per-version study: v*_analyze.py + v*_summary.md + plots
-gb10/, h200/                  ALIGNN-FF on one NVIDIA GB10 / H200 NVL
-├── alignn_ff/                  energy+forces+stress sweep: bench_ff_scaling.py, job.sh, result JSON, README
-├── alignn_ff_b200settings/     B200 settings on pure-PyTorch ALIGNN: scale_pure_b200settings.py, job.sh, result .npz
-└── alignn_ff_max_atoms/        GB10 only: four force fields, all evaluation paths, chunked to 2B atoms, polycrystal, gate stack and STMV virus, README
-analysis/                     cross-GPU comparison
-├── scaling_overview.py         -> scaling_overview.png (energy-only ALIGNN-FF on B200/GB10/H200)
-├── scaling_forces.py           -> scaling_forces.png (energy+forces+stress ALIGNN-FF on GB10/H200)
-├── scaling_all.py              -> scaling_all.png (all five runs on one plot)
-├── cross_gpu_figure.py         -> cross_gpu.png (two panels: energy-only B200/GB10/H200; with forces GB10/H200)
-├── gb10_billion_figures.py     -> gb10_decomposition.png, gb10_scaling.png, gb10_halo.png (GB10 chunked runs)
-├── gb10_energy_maps_figure.py  -> gb10_energy_maps.png (per-atom energy maps; needs the maps from energy_maps.py)
-└── results_report.py           -> results_report.pdf (summary, plot, full result tables)
-```
-
-## Reproducing the analysis
-
-The raw data (`.npz` and JSON for ALIGNN-FF) is committed. Each `analyze.py` re-derives every plot and `metrics.json` from that data:
+Requirements: PyTorch with CUDA, the pure-PyTorch [ALIGNN](https://github.com/atomgptlab/alignn), `ase`, `matscipy` and `jarvis-tools`. DGL is not needed. The paper used ALIGNN commit `6a20fb5` with PyTorch 2.13 and CUDA 13.0. ALIGNN 2026.11.2 gives the same results.
 
 ```bash
-# ALIGNN-FF
-cd b200/alignn_ff/analysis/v6 && python v6_analyze.py
+# ALIGNN with the switches (models without them evaluate unchanged)
+git clone https://github.com/atomgptlab/alignn.git alignn_smooth
+(cd alignn_smooth && git apply ../scalingmat/gb10/alignn_ff_max_atoms/smooth_messages.patch)
+export PYTHONPATH=$PWD/alignn_smooth
 
-# cross-GPU plots and report (plots first)
-cd analysis && python scaling_overview.py && python scaling_forces.py && python scaling_all.py && python cross_gpu_figure.py && python results_report.py
+# weights: unzip the Figshare record; the model folder holds config.json and best_model.pt
+M=/path/to/aff_r2scan_smooth
+cd scalingmat/gb10/alignn_ff_max_atoms
+
+# exactness check: 8,000 atoms of rattled Si, chunked against the full cell, float64
+python smooth_eval.py ff_stream.py chunk --model_dir $M --kind Si --rep 10 --rattle 0.05 \
+    --k 2 --forces --ckpt --validate --float64 --out check
+
+# 8,000,000 atoms with forces on one GPU (6^3 cubes)
+python smooth_eval.py ff_stream.py chunk --model_dir $M --kind Si --rep 100 --rattle 0.05 \
+    --k 6 --forces --ckpt --out si_8M
+python ff_stream.py reduce --out si_8M
+
+# 10^9 atoms in W tasks: run ranks 0 to W-1 (one GPU each, or one after another), then reduce
+python smooth_eval.py ff_stream.py chunk --model_dir $M --kind Si --rep 500 --rattle 0.05 \
+    --k 36 --forces --ckpt --rank 0 --world 12 --out si_1B
 ```
 
-Requires `numpy` and `matplotlib` only. The actual ALIGNN-FF sweeps (scripts in `b200/alignn_ff/`) additionally need `torch`, `dgl`, `ase`, `matscipy`, `alignn`, and `jarvis-tools`, and were run on a Blackwell B200 via SLURM. The GB10 and H200 sweeps use the pure-PyTorch ALIGNN 2.0 (`torch`, `ase`, `matscipy`, `jarvis-tools`; no DGL) and were run via SLURM on atomgptlab (GB10) and Skipjack (H200).
+- `ff_stream.py` generates crystals piece by piece from the lattice, so no task holds the whole cell. `ff_any.py` evaluates any orthorhombic cell written by `cells.py`, such as the polycrystal, the gate stack or water. `ff_max_atoms.py` holds the model, graph and energy code and the single-graph sweeps.
+- `smooth_eval.py` runs either script with the per-atom energies of a model with switches. Without it, such a model stops with an error instead of being evaluated wrongly.
+- The `*.sbatch` and `stage*_submit.sh` files are the Slurm jobs that produced the results. Their paths point to the cluster where they ran.
+
+## Reproducing the figures
+
+The figures are drawn from the committed result JSONs and need only `numpy` and `matplotlib`. Run the scripts from inside `analysis/`. The versions in the paper are in [`analysis/paper_figures/`](analysis/paper_figures/).
+
+```bash
+cd analysis
+# Fig. 2 (decomposition), Fig. 3 (cost and memory) and Fig. S2 (halo width)
+GB10_MODEL=smooth python gb10_billion_figures.py
+# Fig. 4 (per-atom energy maps)
+MAPS_DIR=../gb10/alignn_ff_max_atoms/results/aff_smooth/maps \
+    FIG_OUT=gb10_energy_maps_smooth.png python gb10_energy_maps_figure.py
+# Fig. S1 (other force-field families on one GB10)
+python gb10_other_ff_figure.py
+```
+
+Structures, force arrays and per-atom energies of the largest runs are too large for the repository. Their summaries, and the energy maps drawn from them, are committed.
+
+## Repository layout
+
+```
+gb10/alignn_ff_max_atoms/   the paper: chunked evaluation, retraining, checks, results/, logs/, README
+gb10/other_ff_max_atoms/    SNAP, NEP, Allegro and Deep Potential size sweeps on one GB10 (Fig. S1)
+gb10/alignn_ff_tensorrt/    TensorRT probe (1.1 to 1.3 times faster; fails at large sizes)
+analysis/                   figure scripts, paper_figures/
+b200/, h200/, gb10/alignn_ff/, gb10/alignn_ff_b200settings/,
+analysis/scaling_*.py, cross_gpu_figure.py, results_report.py
+                            earlier single-graph benchmarks (below)
+```
+
+## Earlier single-graph benchmarks
+
+Before the decomposition, ALIGNN-FF was timed as a single graph on one NVIDIA B200 (`b200/alignn_ff/`, Cu FCC, energy only, DGL), one H200 NVL (`h200/`) and one GB10 (`gb10/alignn_ff/`, `gb10/alignn_ff_b200settings/`). These runs found the following.
+
+- Replacing DGL's line-graph construction with a sparse one (`scale5b_v5.py`) made 10^5 to 10^6 atoms tractable on one GPU.
+- In single precision, the energy of a single graph drifts and then jumps past about 470,000 atoms (`b200/alignn_ff/analysis/v6/v6_summary.md`). The chunked evaluation does not have this problem: it gives 0.604014 eV/atom up to 780,448 atoms on a GB10.
+- With the same settings, model inference on the H200 is within 13% of the B200 and about 8 times faster than on the GB10. Through the ASE calculator, energy, forces and stress need 1.95 MB/atom on both the GB10 and the H200.
+
+Each folder has its own README or summary. `analysis/results_report.py` collects these runs into `results_report.pdf`.
 
 ## License
 
-MIT — see `LICENSE`.
+MIT, see `LICENSE`.
